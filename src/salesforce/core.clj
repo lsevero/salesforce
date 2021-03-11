@@ -47,7 +47,8 @@
        (-> (:body resp)
            (json/decode true))))
 
-(def ^:private limit-info (atom {}))
+(def ^:private limit-info (atom {:used 0
+                                 :available 1}))
 
 (def ^:dynamic +limit-threshold+ 0.9)
 
