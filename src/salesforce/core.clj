@@ -94,6 +94,7 @@
               (catch Exception e (:body (ex-data e))))]
     (when (<= +limit-threshold+ (/ used available))
       (log/warn +limit-threshold-log-message+))
+    (log/debug (str "resp: ") resp)
     (-> (get-in resp [:headers "sforce-limit-info"]) ;; Record limit info in atom
         (parse-limit-info)
         ((partial reset! limit-info)))
