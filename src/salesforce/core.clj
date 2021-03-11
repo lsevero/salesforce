@@ -4,7 +4,8 @@
     [cheshire.core :as json]
     [clj-http.client :as http]
     [clojure.string :as str]
-    [clojure.test :refer [is]])
+    [clojure.test :refer [is]]
+    [clojure.tools.logging :as log])
   (:import [java.time LocalDate Instant ZonedDateTime]))
 
 (def ^:dynamic +token+ nil)
@@ -48,14 +49,23 @@
 
 (def ^:private limit-info (atom {}))
 
+(def ^:dynamic +limit-threshold+ 0.9)
+
+(def ^:dynamic +limit-threshold-log-message+ (str "Salesforce limit api call above the threshold of " (* 100 +limit-threshold+) "%"))
+
 (defn- parse-limit-info [v]
-  (let [[used available]
-        (->> (-> (str/split v #"=")
-                 (second)
-                 (str/split #"/"))
-             (map #(Integer/parseInt %)))]
-    {:used used
-     :available available}))
+  "Try to parse the sforce-limit-info header, if it is not available will return {:used 0 :available 1}"
+  (try
+    (let [[used available]
+          (->> (-> (str/split v #"=")
+                   (second)
+                   (str/split #"/"))
+               (map #(Integer/parseInt %)))]
+      {:used used
+       :available available})
+    (catch Exception e
+      {:used 0
+       :available 1})))
 
 (defn read-limit-info
   "Deref the value of the `limit-info` atom which is
@@ -67,9 +77,13 @@
 
 (defn request
   "Make a HTTP request to the Salesforce.com REST API
-   Token is the full map returned from (auth! @conf)"
+   Token is the full map returned from (auth! @conf)
+  
+  Fire logs to warn about the API limit info acordding to (<= +limit-threshold+ (/ (:used (read-limit-info) (:available (read-limit-info))))
+  "
   [method url token & [params]]
-  (let [base-url (:instance_url token)
+  (let [{:keys [used available]} (read-limit-info)
+        base-url (:instance_url token)
         full-url (str base-url url)
         resp (try (http/request
                (merge (or params {})
@@ -77,6 +91,8 @@
                        :url full-url
                        :headers {"Authorization" (str "Bearer " (:access_token token))}}))  
               (catch Exception e (:body (ex-data e))))]
+    (when (<= +limit-threshold+ (/ used available))
+      (log/warn +limit-threshold-log-message+))
     (-> (get-in resp [:headers "sforce-limit-info"]) ;; Record limit info in atom
         (parse-limit-info)
         ((partial reset! limit-info)))
@@ -242,7 +258,7 @@
   "Given an SOQL string, i.e \"SELECT name from Account\"
    generate a Salesforce SOQL query url in the form:
    /services/data/v20.0/query/?q=SELECT+name+from+Account"
-  [version query]
+  [^String version ^String query]
   (let [url  (format "/services/data/v%s/query" version)
         soql (java.net.URLEncoder/encode query "UTF-8")]
     (str url "?q=" soql)))
@@ -255,7 +271,7 @@
   clojure.lang.Ratio (->soql [v] (-> v double str))
   Number (->soql [v] (str v))
   Boolean (->soql [v] (str \' v \'))
-  nil (->soql [v] "'null'")
+  nil (->soql [v] "null")
   LocalDate (->soql [v] (str \' v \'))
   Instant (->soql [v] (str \' v \'))
   ZonedDateTime (->soql [v] (-> v .toInstant (#(str \' % \'))))
@@ -297,3 +313,13 @@
   clojure.lang.Sequential (soql [sqlvec token]
                             (soql (sqlvec->query sqlvec) token)))
 
+(defn consume-all
+  "receives a response map from salesforce.core/request, and consume all the data through the field nexRecordsUrl"
+  [{:keys [done records nextRecordsUrl] :as req-map} auth-info]
+  (if done
+    req-map
+    (let [{:keys [done records nextRecordsUrl] :as new-req-map} (request :get nextRecordsUrl auth-info)]
+      (recur (-> new-req-map
+                 (assoc :done done
+                        :nextRecordsUrl nextRecordsUrl)
+                 (update-in [:records] into records)) auth-info))))
